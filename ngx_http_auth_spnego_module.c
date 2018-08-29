@@ -302,6 +302,56 @@ ngx_http_auth_spnego_init(
 }
 
     static ngx_int_t
+ngx_http_auth_spnego_basic_headers(
+        ngx_http_request_t *r,
+        ngx_http_auth_spnego_loc_conf_t *alcf,
+        ngx_int_t hash)
+{
+    if (!alcf->allow_basic) {
+        return NGX_OK;
+    }
+
+    /* This may have already been done in the SPNEGO header adding, but
+       we want to make sure that it isn't null and that there is at least
+       one WWW-Authenticate header on the list. */
+    if (NULL == r->headers_out.www_authenticate) {
+        r->headers_out.www_authenticate =
+            ngx_list_push(&r->headers_out.headers);
+        if (NULL == r->headers_out.www_authenticate) {
+            return NGX_ERROR;
+        }
+    }
+
+    ngx_str_t value2 = ngx_null_string;
+    value2.len = sizeof("Basic realm=\"\"") - 1 + alcf->realm.len;
+    value2.data = ngx_pcalloc(r->pool, value2.len);
+    if (NULL == value2.data) {
+        return NGX_ERROR;
+    }
+    ngx_snprintf(value2.data, value2.len, "Basic realm=\"%V\"",
+            &alcf->realm);
+    
+    /* If the hash is more than one, then we need to append a new entry to the list.
+       Else, we are just going to use the first (or current) entry for the
+       WWW-Authenticate header so that we can overwrite it if it exists. */
+    if (hash > 1) {
+        r->headers_out.www_authenticate =
+            ngx_list_push(&r->headers_out.headers);
+        if (NULL == r->headers_out.www_authenticate) {
+            return NGX_ERROR;
+        }
+    }
+
+    r->headers_out.www_authenticate->hash = hash;
+    r->headers_out.www_authenticate->key.len = sizeof("WWW-Authenticate") - 1;
+    r->headers_out.www_authenticate->key.data = (u_char *) "WWW-Authenticate";
+    r->headers_out.www_authenticate->value.len = value2.len;
+    r->headers_out.www_authenticate->value.data = value2.data;
+
+    return NGX_OK;
+}
+
+    static ngx_int_t
 ngx_http_auth_spnego_headers(
         ngx_http_request_t *r,
         ngx_http_auth_spnego_ctx_t *ctx,
@@ -335,26 +385,10 @@ ngx_http_auth_spnego_headers(
     r->headers_out.www_authenticate->value.len = value.len;
     r->headers_out.www_authenticate->value.data = value.data;
 
-    if (alcf->allow_basic) {
-        ngx_str_t value2 = ngx_null_string;
-        value2.len = sizeof("Basic realm=\"\"") - 1 + alcf->realm.len;
-        value2.data = ngx_pcalloc(r->pool, value2.len);
-        if (NULL == value2.data) {
-            return NGX_ERROR;
-        }
-        ngx_snprintf(value2.data, value2.len, "Basic realm=\"%V\"",
-                &alcf->realm);
-        r->headers_out.www_authenticate =
-            ngx_list_push(&r->headers_out.headers);
-        if (NULL == r->headers_out.www_authenticate) {
-            return NGX_ERROR;
-        }
-
-        r->headers_out.www_authenticate->hash = 2;
-        r->headers_out.www_authenticate->key.len = sizeof("WWW-Authenticate") - 1;
-        r->headers_out.www_authenticate->key.data = (u_char *) "WWW-Authenticate";
-        r->headers_out.www_authenticate->value.len = value2.len;
-        r->headers_out.www_authenticate->value.data = value2.data;
+    // Add the basic auth headers
+    ngx_int_t baret = ngx_http_auth_spnego_basic_headers(r, alcf, 2);
+    if (baret != NGX_OK) {
+        return baret;
     }
 
     ctx->head = 1;
@@ -410,6 +444,7 @@ ngx_http_auth_spnego_token(
         if (ngx_strncasecmp(
                     token.data, (u_char *) "NTLM", sizeof("NTLM")) == 0) {
             spnego_log_error("Detected unsupported mechanism: NTLM");
+            return NGX_AGAIN;
         }
         return NGX_DECLINED;
     }
@@ -439,6 +474,11 @@ ngx_http_auth_spnego_token(
     ctx->token.len = decoded.len;
     ctx->token.data = decoded.data;
     spnego_debug2("Token decoded: %*s", token.len, token.data);
+
+    if (ngx_strncasecmp(decoded.data, (u_char *) "NTLMSSP", sizeof("NTLMSSP")) == 0) {
+        spnego_log_error("Decoded unsupported NTLMSSP token");
+        return NGX_AGAIN;
+    }
 
     return NGX_OK;
 }
@@ -1020,7 +1060,7 @@ ngx_http_auth_spnego_handler(
         spnego_debug0("Client sent a reasonable Negotiate header");
         ret = ngx_http_auth_spnego_auth_user_gss(r, ctx, alcf);
         if (NGX_ERROR == ret) {
-            spnego_debug0("GSSAPI failed");
+            spnego_debug0("GSSAPI failed - error");
             return (ctx->ret = NGX_HTTP_INTERNAL_SERVER_ERROR);
         }
         /* There are chances that client knows about Negotiate
@@ -1037,6 +1077,21 @@ ngx_http_auth_spnego_handler(
         }
 
         spnego_debug0("GSSAPI auth succeeded");
+    }
+
+    /* We declined from ngx_http_auth_spnego_token which is either an error with GSSAPI
+       or we found a NTLMSSP token. Either way, we should fallback to basic auth. */
+    if (NGX_AGAIN == ret) {
+        spnego_debug0("Attempting fallback to basic auth");
+
+        ngx_int_t bret = ngx_http_auth_spnego_basic_headers(r, alcf, 1);
+        if (bret != NGX_OK) {
+            spnego_debug0("Failed to set basic auth headers on SPNEGO fallback");
+        }
+        if (bret == NGX_OK) {
+            spnego_debug0("GSSAPI declined, falling back to basic auth");
+            return (ctx->ret = NGX_HTTP_UNAUTHORIZED);
+        }
     }
 
     ngx_str_t *token_out_b64 = NULL;
